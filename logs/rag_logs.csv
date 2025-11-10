@@ -1,0 +1,3 @@
+timestamp,query,elapsed_time_sec,avg_similarity,model,top_contexts,answer_summary
+2025-11-10 15:57:01,이 모델은 어떤 방식으로 학습되었어?,28.57,0.5578,llama3:latest,bge-m3.pdf; unknown; unknown,"본 모델은 사전 훈련된 XLM-RoBERTa8를 기초 모델로 채택하고, Retro-MAE(Xiao et al., 2022) 방법을 통해 모델을 업데이트합니다. 최대 위치는 8192"
+2025-11-10 16:11:58,vertor논문의 핵심이 뭐야?,17.12,0.4628,llama3:latest,vector.pdf; vector.pdf; vector.pdf,vector 논문의 핵심은 다음과 같습니다.  * 네트워크 기반의 언어 모델들이 N-gram 모델보다significantly outperform하는 것을 보여주는 것 * 단일 문서
