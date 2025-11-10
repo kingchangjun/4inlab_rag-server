@@ -10,5 +10,10 @@ PDF 메뉴얼이나 논문을 업로드하면, Qdrant 벡터 DB에 인베딩되�
 - /collections : Qrant 컬렉션 조회
 - /collection/{name}/points : 포인트 조회
 
-  ### Docker 환경
-  docker compose up --build
+### Docker 환경
+ docker compose up --build
+
+### 버전
+- python : 3.10.13
+
+  
