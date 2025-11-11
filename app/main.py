@@ -11,6 +11,7 @@ import time
 import os
 import csv
 from datetime import datetime
+import numpy as np
 
 app = FastAPI(title="Local RAG API with Metrics & Logging")
 
@@ -20,7 +21,9 @@ QDRANT_PORT = 6333
 OLLAMA_API = "http://localhost:11434/api/generate"  
 
 # 임베딩 모델, Qdrant 초기화
-model = SentenceTransformer("BAAI/bge-m3")
+#model = SentenceTransformer("BAAI/bge-m3")
+model  = SentenceTransformer("nlpai-lab/KURE-v1")
+embedding_model_name = "nlpai-lab/KURE-v1"
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 #로그 저장 디렉토리 설정
@@ -33,7 +36,7 @@ if not os.path.exists(LOG_FILE):
         writer = csv.writer(f)
         writer.writerow([
             "timestamp", "query", "elapsed_time_sec",
-            "avg_similarity", "model", "top_contexts", "answer_summary"
+            "avg_similarity", "embedding_model", "llm_model", "top_contexts", "answer_summary"
         ])
 
 # Qdrant 초기 설정
@@ -53,7 +56,7 @@ def extract_text_from_pdf(file):
         text += page.get_text("text") + "\n"
     return text
 
-# 텍스트 청크 분할
+# 텍스트 분할
 def chunk_text(text, max_len=500):
     sentences = text.split("\n")
     chunks, current_chunk = [], ""
@@ -67,7 +70,7 @@ def chunk_text(text, max_len=500):
         chunks.append(current_chunk.strip())
     return chunks
 
-
+#pdf 벡터화, db 저장
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...)):
     text = extract_text_from_pdf(file)
@@ -94,10 +97,19 @@ async def ingest(file: UploadFile = File(...)):
 async def ask(query: str = Form(...)):
     start_time = time.time()
     model_name = "llama3:latest"
-
+    
+    #쿼리 임베딩
     q_emb = model.encode([query])[0]
+    
+    #qdrant에서 유사 문서 검색
     results = qdrant.search(collection_name="manuals", query_vector=q_emb, limit=3)
+    
+    #평균 유사도 계산
+    avg_similarity = np.mean([r.score for r in results]) if results else 0.0
+    #avg_similarity = round(sum(similarities) / len(similarities), 4) if similarities else 0.0
 
+
+    #검색결과 병합
     context = ""
     similarities = []
     top_contexts = []
@@ -109,7 +121,6 @@ async def ask(query: str = Form(...)):
         sim = util.cos_sim(q_emb, model.encode(r.payload["text"]))[0][0].item()
         similarities.append(sim)
 
-    avg_similarity = round(sum(similarities) / len(similarities), 4) if similarities else 0.0
 
     prompt = f"""
     모든 답변은 반드시 한국어로 작성하라.
@@ -151,6 +162,8 @@ async def ask(query: str = Form(...)):
         return {"error": "응답이 비어 있습니다."}
 
     # 로그 저장
+    output_clean = output.replace("\n"," ")
+
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -158,9 +171,10 @@ async def ask(query: str = Form(...)):
             query,
             elapsed_time,
             avg_similarity,
+            embedding_model_name,
             model_name,
             "; ".join(top_contexts),
-            output[:100].replace("\n", " ")
+            output_clean # 답변 전체 기록
         ])
 
     return JSONResponse(
@@ -168,11 +182,13 @@ async def ask(query: str = Form(...)):
             "answer": output,
             "elapsed_time_sec": elapsed_time,
             "avg_similarity": avg_similarity,
+            "embedding_model" : embedding_model_name,
             "logged": True
         }
     )
 
 
+#qdrant 상태 확인
 @app.get("/collections")
 async def list_collections():
     return qdrant.get_collections()
