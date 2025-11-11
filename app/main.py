@@ -1,20 +1,45 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import VectorParams, PointStruct
-import fitz  # PyMuPDF
+import fitz
 import uuid
 import json
 import requests
+import time
+import os
+import csv
+from datetime import datetime
+import numpy as np
 
-app = FastAPI(title="Local RAG API")
+app = FastAPI(title="Local RAG API with Metrics & Logging")
 
-# 초기화: 임베딩 모델 & Qdrant 클라이언트
-model = SentenceTransformer("BAAI/bge-m3")
-qdrant = QdrantClient(host="qdrant", port=6333)
+#로컬용 설정
+QDRANT_HOST = "localhost"   
+QDRANT_PORT = 6333
+OLLAMA_API = "http://localhost:11434/api/generate"  
 
-# manuals 컬렉션이 없으면 생성
+# 임베딩 모델, Qdrant 초기화
+#model = SentenceTransformer("BAAI/bge-m3")
+model  = SentenceTransformer("nlpai-lab/KURE-v1")
+embedding_model_name = "nlpai-lab/KURE-v1"
+qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+#로그 저장 디렉토리 설정
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "rag_logs.csv")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp", "query", "elapsed_time_sec",
+            "avg_similarity", "embedding_model", "llm_model", "top_contexts", "answer_summary"
+        ])
+
+# Qdrant 초기 설정
 try:
     qdrant.get_collection("manuals")
 except Exception:
@@ -23,7 +48,7 @@ except Exception:
         vectors_config=VectorParams(size=1024, distance="Cosine")
     )
 
-# PDF → 텍스트 추출 함수
+# PDF 텍스트 추출
 def extract_text_from_pdf(file):
     pdf = fitz.open(stream=file.file.read(), filetype="pdf")
     text = ""
@@ -31,7 +56,7 @@ def extract_text_from_pdf(file):
         text += page.get_text("text") + "\n"
     return text
 
-# 텍스트 청크 분할 함수
+# 텍스트 분할
 def chunk_text(text, max_len=500):
     sentences = text.split("\n")
     chunks, current_chunk = [], ""
@@ -45,7 +70,7 @@ def chunk_text(text, max_len=500):
         chunks.append(current_chunk.strip())
     return chunks
 
-# /ingest - PDF 업로드 → 벡터DB 저장
+#pdf 벡터화, db 저장
 @app.post("/ingest")
 async def ingest(file: UploadFile = File(...)):
     text = extract_text_from_pdf(file)
@@ -56,63 +81,69 @@ async def ingest(file: UploadFile = File(...)):
         PointStruct(
             id=str(uuid.uuid4()),
             vector=embeddings[i],
-            payload={"text": chunks[i]}
+            payload={
+                "text": chunks[i],
+                "source": file.filename
+            }
         )
         for i in range(len(chunks))
     ]
 
-    qdrant.recreate_collection(
-        collection_name="manuals",
-        vectors_config=VectorParams(size=len(embeddings[0]), distance="Cosine")
-    )
-
     qdrant.upload_points(collection_name="manuals", points=points)
-    return {"status": "ok", "chunks_saved": len(chunks)}
+    return {"status": "ok", "file": file.filename, "chunks_saved": len(chunks)}
 
 
-# /ask - 질의 → Qdrant 검색 → Ollama 전달
 @app.post("/ask")
 async def ask(query: str = Form(...)):
-    # 질의 임베딩
+    start_time = time.time()
+    model_name = "llama3:latest"
+    
+    #쿼리 임베딩
     q_emb = model.encode([query])[0]
-
-    # Qdrant에서 관련 문서 검색
+    
+    #qdrant에서 유사 문서 검색
     results = qdrant.search(collection_name="manuals", query_vector=q_emb, limit=3)
+    
+    #평균 유사도 계산
+    avg_similarity = np.mean([r.score for r in results]) if results else 0.0
+    #avg_similarity = round(sum(similarities) / len(similarities), 4) if similarities else 0.0
 
-    # 검색 결과 텍스트 병합
-    context = "\n".join([r.payload["text"] for r in results])
 
-    print("\n===== [검색된 컨텍스트] =====")
-    print(context)
-    print("============================\n")
+    #검색결과 병합
+    context = ""
+    similarities = []
+    top_contexts = []
 
-    # LLM 프롬프트 구성
+    for r in results:
+        src = r.payload.get("source", "unknown")
+        top_contexts.append(src)
+        context += f"\n[출처: {src}]\n{r.payload['text']}\n"
+        sim = util.cos_sim(q_emb, model.encode(r.payload["text"]))[0][0].item()
+        similarities.append(sim)
+
+
     prompt = f"""
-	모든 답변은 반드시 한국어로 작성하라.
-	너는 논문을 잘 이해하고 설명하는 전문가이다.
-	아래 참고내용을 바탕으로 사용자의 질문에 명확하고 간결하게 답변하라.
-	
-	- 답변은 반드시 한국어로 자연스럽고 명확하게 작성할 것.
-	- 논리적이고 간결하게 요약할 것.
-	- 기술용어는 한국어로 번역하되, 원어(영문)도 괄호 안에 함께 표기할 것.
-	[참고 내용]
+    모든 답변은 반드시 한국어로 작성하라.
+    너는 논문을 잘 이해하고 설명하는 전문가이다.
+    아래 참고내용을 바탕으로 사용자의 질문에 명확하고 간결하게 답변하라.
+
+    [참고 내용]
     {context}
 
     [질문]
     {query}
     """
 
-    # Ollama REST API 호출
+    #Ollama 로컬 REST API 호출
     response = requests.post(
-        "http://host.docker.internal:11434/api/generate",
-        json={"model": "llama3:latest", "prompt": prompt},
+        OLLAMA_API,
+        json={"model": model_name, "prompt": prompt},
         stream=True
     )
 
     if response.status_code != 200:
         return {"error": response.text}
 
-	# Ollama 스트리밍 JSON 파싱
     output = ""
     for line in response.iter_lines():
         if line:
@@ -124,18 +155,44 @@ async def ask(query: str = Form(...)):
             except Exception:
                 continue
 
-    # 개행문자 및 불필요한 이스케이프 제거
-    output = output.replace("\\n", " ").replace("\n", " ").strip()
+    output = output.replace("\\n", "\n").strip()
+    elapsed_time = round(time.time() - start_time, 2)
 
     if not output.strip():
-        return {"error": "응답이 비어 있습니다. 모델 이름 또는 서버 상태를 확인하세요."}
+        return {"error": "응답이 비어 있습니다."}
 
-    return JSONResponse(content={"answer": output})
+    # 로그 저장
+    output_clean = output.replace("\n"," ")
 
-# Qdrant 데이터 확인용 API
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            query,
+            elapsed_time,
+            avg_similarity,
+            embedding_model_name,
+            model_name,
+            "; ".join(top_contexts),
+            output_clean # 답변 전체 기록
+        ])
+
+    return JSONResponse(
+        content={
+            "answer": output,
+            "elapsed_time_sec": elapsed_time,
+            "avg_similarity": avg_similarity,
+            "embedding_model" : embedding_model_name,
+            "logged": True
+        }
+    )
+
+
+#qdrant 상태 확인
 @app.get("/collections")
 async def list_collections():
     return qdrant.get_collections()
+
 
 @app.get("/collection/{name}/points")
 async def show_points(name: str, limit: int = 5):
